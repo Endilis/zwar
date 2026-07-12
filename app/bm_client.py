@@ -81,14 +81,13 @@ class BattleMetricsRateLimiter:
         path: str,
         *,
         params: dict | None = None,
-        token: str,
+        token: str | None,
         max_retries: int = 3,
     ) -> dict:
         url = f"{BASE_URL}{path}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.api+json",
-        }
+        headers = {"Accept": "application/vnd.api+json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         for attempt in range(1, max_retries + 1):
             async with self._lock:
@@ -148,7 +147,13 @@ async def _request_any_token(session: aiohttp.ClientSession, method: str, path: 
     """Пробует токены по очереди, начиная с последнего рабочего. Переключение
     ТОЛЬКО на 401 (сам токен невалиден/отозван) — на 429/403 (rate limit,
     ip-бан) переключать токен бессмысленно и вредно: это лимит на уровне
-    IP/аккаунта, а не токена, так что просто множит запросы без толку."""
+    IP/аккаунта, а не токена, так что просто множит запросы без толку.
+
+    Если ВСЕ токены отклонены — последняя попытка вообще без токена.
+    BattleMetrics разрешает неаутентифицированные запросы (свой, более
+    скромный лимит: 15/сек, 60/мин против 45/сек, 300/мин с токеном) —
+    некоторые эндпоинты (например прямой GET /players/{id}) могут работать
+    и без токена, даже если filter[search] его требует."""
     global _working_token_index
     tokens = config.BATTLEMETRICS_TOKENS
     last_exc: BattleMetricsError | None = None
@@ -165,7 +170,11 @@ async def _request_any_token(session: aiohttp.ClientSession, method: str, path: 
             logger.warning("BM токен #%s отклонён (401), пробуем следующий", idx)
             last_exc = exc
 
-    raise last_exc or BattleMetricsError("Все токены BattleMetrics отклонены (401)")
+    logger.warning("Все %s токенов отклонены (401), пробуем без токена", len(tokens))
+    try:
+        return await _limiter.request(session, method, path, params=params, token=None)
+    except BattleMetricsError as exc:
+        raise last_exc or exc
 
 
 async def search_players(nickname: str, *, page_size: int = 20) -> list[dict]:
