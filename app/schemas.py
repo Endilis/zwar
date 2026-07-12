@@ -32,3 +32,11 @@ class StatusResponse(BaseModel):
     checked_at: float | None = None
     is_stale: bool | None = None
     pending: bool = False
+
+
+class StatusBatchRequest(BaseModel):
+    bm_player_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class StatusBatchResponse(BaseModel):
+    statuses: dict[str, StatusResponse]

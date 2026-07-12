@@ -7,7 +7,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from . import bm_client, config, poller, store
-from .schemas import SearchRequest, SearchResponse, StatusResponse, TrackRequest
+from .schemas import (
+    SearchRequest,
+    SearchResponse,
+    StatusBatchRequest,
+    StatusBatchResponse,
+    StatusResponse,
+    TrackRequest,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -78,3 +85,22 @@ async def get_status(bm_player_id: str) -> StatusResponse:
     if status is None:
         return StatusResponse(bm_player_id=bm_player_id, pending=True)
     return StatusResponse(**status)
+
+
+@app.post(
+    "/players/status/batch",
+    response_model=StatusBatchResponse,
+    dependencies=[Depends(require_panel_secret)],
+)
+async def get_status_batch(body: StatusBatchRequest) -> StatusBatchResponse:
+    """Пачка статусов за один Redis MGET — ноль обращений к BattleMetrics.
+    Использовать вместо N вызовов /players/{id}/status, когда нужно сразу
+    много игроков (например список слежки пользователя)."""
+    raw = await store.get_status_batch(body.bm_player_ids)
+    out: dict[str, StatusResponse] = {}
+    for bm_player_id, status in raw.items():
+        if status is None:
+            out[bm_player_id] = StatusResponse(bm_player_id=bm_player_id, pending=True)
+        else:
+            out[bm_player_id] = StatusResponse(**status)
+    return StatusBatchResponse(statuses=out)

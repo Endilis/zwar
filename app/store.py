@@ -67,3 +67,23 @@ async def get_status(bm_player_id: str) -> dict | None:
     checked_at = status.get("checked_at") or 0
     status["is_stale"] = (time.time() - checked_at) > config.STATUS_STALE_AFTER_SEC
     return status
+
+
+async def get_status_batch(bm_player_ids: list[str]) -> dict[str, dict | None]:
+    """MGET по всем сразу — один round-trip к Redis, ноль запросов к BM."""
+    if not bm_player_ids:
+        return {}
+    r = await get_redis()
+    keys = [f"{STATUS_KEY_PREFIX}{pid}" for pid in bm_player_ids]
+    raw_values = await r.mget(keys)
+    now = time.time()
+    out: dict[str, dict | None] = {}
+    for pid, raw in zip(bm_player_ids, raw_values):
+        if not raw:
+            out[pid] = None
+            continue
+        status = json.loads(raw)
+        checked_at = status.get("checked_at") or 0
+        status["is_stale"] = (now - checked_at) > config.STATUS_STALE_AFTER_SEC
+        out[pid] = status
+    return out
