@@ -3,7 +3,7 @@ services:
     name: battlemetrics-relay
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter
+    plan: free
     healthCheckPath: /health
     envVars:
       - key: BATTLEMETRICS_TOKENS
