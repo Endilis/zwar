@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: battlemetrics-relay
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: BATTLEMETRICS_TOKENS
+        sync: false
+      - key: RELAY_SHARED_SECRET
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: battlemetrics-relay-redis
+          property: connectionString
+      - key: BM_MIN_REQUEST_INTERVAL_SEC
+        value: "1.0"
+      - key: WATCH_REFRESH_WINDOW_SEC
+        value: "300"
+
+  - type: keyvalue
+    name: battlemetrics-relay-redis
+    plan: free
+    ipAllowList: []
