@@ -141,15 +141,38 @@ async def close_session() -> None:
         _session = None
 
 
-def _primary_token() -> str:
-    return config.BATTLEMETRICS_TOKENS[0]
+_working_token_index = 0
+
+
+async def _request_any_token(session: aiohttp.ClientSession, method: str, path: str, *, params: dict | None = None) -> dict:
+    """Пробует токены по очереди, начиная с последнего рабочего. Переключение
+    ТОЛЬКО на 401 (сам токен невалиден/отозван) — на 429/403 (rate limit,
+    ip-бан) переключать токен бессмысленно и вредно: это лимит на уровне
+    IP/аккаунта, а не токена, так что просто множит запросы без толку."""
+    global _working_token_index
+    tokens = config.BATTLEMETRICS_TOKENS
+    last_exc: BattleMetricsError | None = None
+
+    for offset in range(len(tokens)):
+        idx = (_working_token_index + offset) % len(tokens)
+        try:
+            data = await _limiter.request(session, method, path, params=params, token=tokens[idx])
+            _working_token_index = idx
+            return data
+        except BattleMetricsError as exc:
+            if " -> 401:" not in str(exc):
+                raise
+            logger.warning("BM токен #%s отклонён (401), пробуем следующий", idx)
+            last_exc = exc
+
+    raise last_exc or BattleMetricsError("Все токены BattleMetrics отклонены (401)")
 
 
 async def search_players(nickname: str, *, page_size: int = 20) -> list[dict]:
     """Поиск кандидатов по нику — 1 запрос к BM, без фильтра на точное совпадение
     (в отличие от legacy): панель показывает варианты, пользователь выбирает сам."""
     session = await get_session()
-    data = await _limiter.request(
+    data = await _request_any_token(
         session, "GET", "/players",
         params={
             "filter[search]": f'"{nickname}"',
@@ -157,7 +180,6 @@ async def search_players(nickname: str, *, page_size: int = 20) -> list[dict]:
             "include": "server",
             "sort": "-lastSeen",
         },
-        token=_primary_token(),
     )
     included_servers = {
         item["id"]: item.get("attributes", {})
@@ -193,10 +215,9 @@ async def fetch_player_status(bm_player_id: str) -> dict:
     """Снимок статуса одного игрока — 1 запрос к BM (include=server даёт нужные
     данные без дополнительного запроса на сессии, этого достаточно для online/offline)."""
     session = await get_session()
-    data = await _limiter.request(
+    data = await _request_any_token(
         session, "GET", f"/players/{bm_player_id}",
         params={"include": "server"},
-        token=_primary_token(),
     )
     player = data.get("data") or {}
     attrs = player.get("attributes") or {}
