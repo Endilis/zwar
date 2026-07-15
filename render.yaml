@@ -16,7 +16,7 @@ services:
           name: battlemetrics-relay-redis
           property: connectionString
       - key: BM_MIN_REQUEST_INTERVAL_SEC
-        value: "1.0"
+        value: "0.05"
       - key: WATCH_REFRESH_WINDOW_SEC
         value: "300"
 

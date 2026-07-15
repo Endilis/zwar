@@ -36,50 +36,73 @@ class BattleMetricsRateLimiter:
     отслеживаемых игроков или параллельных поисков запрошено внутри сервиса.
     """
 
+class TokenRateLimiter:
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._last_request_ts = 0.0
-        self._rate_remaining: int | None = None
-        self._rate_limit: int | None = None
-        self._rate_reset_ts: float | None = None
-        self._rate_reset_raw_header: str | None = None
-        self._backoff_until = 0.0
-        self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
+        self.lock = asyncio.Lock()
+        self.last_request_ts = 0.0
+        self.rate_remaining: int | None = None
+        self.rate_limit: int | None = None
+        self.rate_reset_ts: float | None = None
+        self.rate_reset_raw_header: str | None = None
+        self.backoff_until = 0.0
+        self.backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
+
+class BattleMetricsRateLimiter:
+    """Токенизированный ограничитель частоты запросов к BattleMetrics API.
+    Содержит независимые лимитеры (TokenRateLimiter) для каждого токена/no-token,
+    благодаря чему медленные запросы или бэкоффы по одному токену не тормозят остальные.
+    """
+
+    def __init__(self) -> None:
+        self._limiters: dict[str, TokenRateLimiter] = {}
         self._waiters = 0
 
+    def _get_limiter(self, token: str | None) -> TokenRateLimiter:
+        key = token or ""
+        if key not in self._limiters:
+            self._limiters[key] = TokenRateLimiter()
+        return self._limiters[key]
+
     def debug_state(self) -> dict:
-        """Снимок состояния лимитера через API (логов Render под рукой нет) —
-        см. инцидент 2026-07-15, поиск/статус зависали на много минут."""
+        """Снимок состояния лимитера через API."""
         now = time.monotonic()
+        limiters_info = {}
+        for key, lim in self._limiters.items():
+            masked_key = (key[:10] + "..." + key[-10:]) if len(key) > 20 else (key or "no-token")
+            limiters_info[masked_key] = {
+                "lock_locked": lim.lock.locked(),
+                "rate_remaining": lim.rate_remaining,
+                "rate_limit": lim.rate_limit,
+                "rate_reset_raw_header": lim.rate_reset_raw_header,
+                "rate_reset_in_sec": (lim.rate_reset_ts - now) if lim.rate_reset_ts else None,
+                "backoff_in_sec": max(0.0, lim.backoff_until - now),
+                "seconds_since_last_request": (now - lim.last_request_ts) if lim.last_request_ts else None,
+            }
+        
+        # Для обратной совместимости с check_limiter.py возвращаем показатели первого токена на верхнем уровне
+        first_lim = list(self._limiters.values())[0] if self._limiters else None
         return {
             "waiters_in_queue": self._waiters,
-            "lock_locked": self._lock.locked(),
-            "rate_remaining": self._rate_remaining,
-            "rate_limit": self._rate_limit,
-            "rate_reset_raw_header": self._rate_reset_raw_header,
-            "rate_reset_in_sec": (self._rate_reset_ts - now) if self._rate_reset_ts else None,
-            "backoff_in_sec": max(0.0, self._backoff_until - now),
-            "seconds_since_last_request": (now - self._last_request_ts) if self._last_request_ts else None,
+            "lock_locked": first_lim.lock.locked() if first_lim else False,
+            "rate_remaining": first_lim.rate_remaining if first_lim else None,
+            "rate_limit": first_lim.rate_limit if first_lim else None,
+            "rate_reset_raw_header": first_lim.rate_reset_raw_header if first_lim else None,
+            "rate_reset_in_sec": ((first_lim.rate_reset_ts - now) if first_lim.rate_reset_ts else None) if first_lim else None,
+            "backoff_in_sec": max(0.0, first_lim.backoff_until - now) if first_lim else 0.0,
+            "seconds_since_last_request": ((now - first_lim.last_request_ts) if first_lim.last_request_ts else None) if first_lim else None,
+            "limiters": limiters_info
         }
 
-    async def _wait_turn(self) -> None:
-        # ИНЦИДЕНТ 2026-07-15: эта функция вызывается ВНУТРИ self._lock — если
-        # тут случайно посчитается неадекватно большое ожидание (например
-        # рассинхрон единиц в X-Rate-Limit-Reset — сек vs мс, или сам
-        # заголовок странный), лок держится всё это время, и ВСЕ запросы
-        # процесса (поиск/статус/прокси/фоновый опрос panel-api) синхронно
-        # виснут на многие минуты — ровно так уронило поиск в панели. Явный
-        # потолок на разовое ожидание — последний рубеж, независимо от того,
-        # что именно пошло не так при расчёте wait.
+    async def _wait_turn(self, limiter: TokenRateLimiter) -> None:
         now = time.monotonic()
-        if self._backoff_until > now:
-            wait = min(self._backoff_until - now, config.BM_MAX_BACKOFF_SEC)
+        if limiter.backoff_until > now:
+            wait = min(limiter.backoff_until - now, config.BM_MAX_BACKOFF_SEC)
             await asyncio.sleep(wait)
             now = time.monotonic()
 
-        if self._rate_remaining is not None and self._rate_remaining <= config.BM_RATE_LIMIT_SAFETY_MARGIN:
-            if self._rate_reset_ts and self._rate_reset_ts > now:
-                raw_wait = self._rate_reset_ts - now
+        if limiter.rate_remaining is not None and limiter.rate_remaining <= config.BM_RATE_LIMIT_SAFETY_MARGIN:
+            if limiter.rate_reset_ts and limiter.rate_reset_ts > now:
+                raw_wait = limiter.rate_reset_ts - now
                 wait = min(raw_wait, _MAX_SINGLE_WAIT_SEC)
                 if raw_wait > _MAX_SINGLE_WAIT_SEC:
                     logger.warning(
@@ -87,33 +110,33 @@ class BattleMetricsRateLimiter:
                         raw_wait, _MAX_SINGLE_WAIT_SEC,
                     )
                 else:
-                    logger.info("BM rate budget низкий (remaining=%s), ждём %.1fs до сброса окна", self._rate_remaining, wait)
+                    logger.info("BM rate budget низкий (remaining=%s), ждём %.1fs до сброса окна", limiter.rate_remaining, wait)
                 await asyncio.sleep(wait)
                 now = time.monotonic()
-                self._rate_remaining = None  # окно сброшено, разблокируем до следующего заголовка
+                limiter.rate_remaining = None  # окно сброшено, разблокируем до следующего заголовка
 
         min_gap = config.BM_MIN_REQUEST_INTERVAL_SEC
-        elapsed = now - self._last_request_ts
+        elapsed = now - limiter.last_request_ts
         if elapsed < min_gap:
             await asyncio.sleep(min_gap - elapsed)
 
-    def _record_headers(self, headers: "aiohttp.typedefs.LooseHeaders") -> None:
+    def _record_headers(self, limiter: TokenRateLimiter, headers: "aiohttp.typedefs.LooseHeaders") -> None:
         remaining = headers.get("X-Rate-Limit-Remaining")
         limit = headers.get("X-Rate-Limit-Limit")
         reset = headers.get("X-Rate-Limit-Reset")
-        self._rate_reset_raw_header = reset
+        limiter.rate_reset_raw_header = reset
         if remaining is not None and remaining.isdigit():
-            self._rate_remaining = int(remaining)
+            limiter.rate_remaining = int(remaining)
         if limit is not None and limit.isdigit():
-            self._rate_limit = int(limit)
+            limiter.rate_limit = int(limit)
         if reset is not None:
             try:
                 # BM отдаёт unix-timestamp секунд до сброса окна.
-                self._rate_reset_ts = time.monotonic() + max(0.0, float(reset) - time.time())
+                limiter.rate_reset_ts = time.monotonic() + max(0.0, float(reset) - time.time())
             except ValueError:
                 pass
-        if limit and self._rate_remaining is not None:
-            logger.debug("BM rate: %s/%s remaining", self._rate_remaining, limit)
+        if limit and limiter.rate_remaining is not None:
+            logger.debug("BM rate: %s/%s remaining", limiter.rate_remaining, limit)
 
     async def request(
         self,
@@ -130,38 +153,28 @@ class BattleMetricsRateLimiter:
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
+        limiter = self._get_limiter(token)
         self._waiters += 1
         try:
             for attempt in range(1, max_retries + 1):
-                async with self._lock:
-                    await self._wait_turn()
-                    self._last_request_ts = time.monotonic()
-                    # НАСТОЯЩАЯ ПРИЧИНА инцидента 2026-07-15 (не расчёт wait,
-                    # как думал сначала): здесь не было своего таймаута.
-                    # get_session() создаёт голый aiohttp.ClientSession без
-                    # timeout=, а этот вызов держит self._lock — если BM/сеть
-                    # зависает без ответа и без TCP RST, aiohttp ждёт дефолтные
-                    # 300с (или дольше), и ВСЕ остальные запросы процесса
-                    # (поиск/статус/прокси/поллер panel-api) блокируются на
-                    # это время. Явный таймаут — обязателен именно тут, а не
-                    # только на вызывающей стороне (клиентский timeout бота
-                    # не спасает: раз лок держится в relay, ответа не будет,
-                    # пока не истечёт именно ЭТОТ таймаут).
+                async with limiter.lock:
+                    await self._wait_turn(limiter)
+                    limiter.last_request_ts = time.monotonic()
                     request_timeout = aiohttp.ClientTimeout(connect=2.0, total=4.0)
                     try:
                         async with session.request(
                             method, url, headers=headers, params=params, timeout=request_timeout,
                         ) as resp:
-                            self._record_headers(resp.headers)
+                            self._record_headers(limiter, resp.headers)
 
                             if resp.status == 429:
                                 retry_after_raw = resp.headers.get("Retry-After")
                                 if retry_after_raw and retry_after_raw.isdigit():
                                     wait = float(retry_after_raw)
                                 else:
-                                    wait = min(self._backoff_sec, config.BM_MAX_BACKOFF_SEC)
-                                    self._backoff_sec = min(self._backoff_sec * 2, config.BM_MAX_BACKOFF_SEC)
-                                self._backoff_until = time.monotonic() + wait
+                                    wait = min(limiter.backoff_sec, config.BM_MAX_BACKOFF_SEC)
+                                    limiter.backoff_sec = min(limiter.backoff_sec * 2, config.BM_MAX_BACKOFF_SEC)
+                                limiter.backoff_until = time.monotonic() + wait
                                 logger.warning(
                                     "BM 429 на %s %s (попытка %s/%s), ждём %.1fs",
                                     method, path, attempt, max_retries, wait,
@@ -169,7 +182,7 @@ class BattleMetricsRateLimiter:
                                 continue
 
                             # Успешный ответ (не обязательно 429) — сбрасываем экспоненту backoff.
-                            self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
+                            limiter.backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
 
                             if resp.status >= 400:
                                 text = await resp.text()
