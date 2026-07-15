@@ -11,6 +11,10 @@ from . import config
 logger = logging.getLogger("bm_client")
 
 BASE_URL = "https://api.battlemetrics.com"
+# Потолок на одно ожидание внутри _wait_turn (кроме уже осмысленно
+# ограниченного BM_MAX_BACKOFF_SEC для настоящих 429) — BM отдаёт лимиты
+# на минутное окно, 65с с запасом. См. докстринг _wait_turn.
+_MAX_SINGLE_WAIT_SEC = 65.0
 
 
 class BattleMetricsError(Exception):
@@ -41,15 +45,31 @@ class BattleMetricsRateLimiter:
         self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
 
     async def _wait_turn(self) -> None:
+        # ИНЦИДЕНТ 2026-07-15: эта функция вызывается ВНУТРИ self._lock — если
+        # тут случайно посчитается неадекватно большое ожидание (например
+        # рассинхрон единиц в X-Rate-Limit-Reset — сек vs мс, или сам
+        # заголовок странный), лок держится всё это время, и ВСЕ запросы
+        # процесса (поиск/статус/прокси/фоновый опрос panel-api) синхронно
+        # виснут на многие минуты — ровно так уронило поиск в панели. Явный
+        # потолок на разовое ожидание — последний рубеж, независимо от того,
+        # что именно пошло не так при расчёте wait.
         now = time.monotonic()
         if self._backoff_until > now:
-            await asyncio.sleep(self._backoff_until - now)
+            wait = min(self._backoff_until - now, config.BM_MAX_BACKOFF_SEC)
+            await asyncio.sleep(wait)
             now = time.monotonic()
 
         if self._rate_remaining is not None and self._rate_remaining <= config.BM_RATE_LIMIT_SAFETY_MARGIN:
             if self._rate_reset_ts and self._rate_reset_ts > now:
-                wait = self._rate_reset_ts - now
-                logger.info("BM rate budget низкий (remaining=%s), ждём %.1fs до сброса окна", self._rate_remaining, wait)
+                raw_wait = self._rate_reset_ts - now
+                wait = min(raw_wait, _MAX_SINGLE_WAIT_SEC)
+                if raw_wait > _MAX_SINGLE_WAIT_SEC:
+                    logger.warning(
+                        "BM rate wait %.1fs выглядит неадекватно (заголовок X-Rate-Limit-Reset?) — обрезаю до %.0fs",
+                        raw_wait, _MAX_SINGLE_WAIT_SEC,
+                    )
+                else:
+                    logger.info("BM rate budget низкий (remaining=%s), ждём %.1fs до сброса окна", self._rate_remaining, wait)
                 await asyncio.sleep(wait)
                 now = time.monotonic()
                 self._rate_remaining = None  # окно сброшено, разблокируем до следующего заголовка
