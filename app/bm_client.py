@@ -136,31 +136,49 @@ class BattleMetricsRateLimiter:
                 async with self._lock:
                     await self._wait_turn()
                     self._last_request_ts = time.monotonic()
-                    async with session.request(method, url, headers=headers, params=params) as resp:
-                        self._record_headers(resp.headers)
+                    # НАСТОЯЩАЯ ПРИЧИНА инцидента 2026-07-15 (не расчёт wait,
+                    # как думал сначала): здесь не было своего таймаута.
+                    # get_session() создаёт голый aiohttp.ClientSession без
+                    # timeout=, а этот вызов держит self._lock — если BM/сеть
+                    # зависает без ответа и без TCP RST, aiohttp ждёт дефолтные
+                    # 300с (или дольше), и ВСЕ остальные запросы процесса
+                    # (поиск/статус/прокси/поллер panel-api) блокируются на
+                    # это время. Явный таймаут — обязателен именно тут, а не
+                    # только на вызывающей стороне (клиентский timeout бота
+                    # не спасает: раз лок держится в relay, ответа не будет,
+                    # пока не истечёт именно ЭТОТ таймаут).
+                    request_timeout = aiohttp.ClientTimeout(total=20.0)
+                    try:
+                        async with session.request(
+                            method, url, headers=headers, params=params, timeout=request_timeout,
+                        ) as resp:
+                            self._record_headers(resp.headers)
 
-                        if resp.status == 429:
-                            retry_after_raw = resp.headers.get("Retry-After")
-                            if retry_after_raw and retry_after_raw.isdigit():
-                                wait = float(retry_after_raw)
-                            else:
-                                wait = min(self._backoff_sec, config.BM_MAX_BACKOFF_SEC)
-                                self._backoff_sec = min(self._backoff_sec * 2, config.BM_MAX_BACKOFF_SEC)
-                            self._backoff_until = time.monotonic() + wait
-                            logger.warning(
-                                "BM 429 на %s %s (попытка %s/%s), ждём %.1fs",
-                                method, path, attempt, max_retries, wait,
-                            )
-                            continue
+                            if resp.status == 429:
+                                retry_after_raw = resp.headers.get("Retry-After")
+                                if retry_after_raw and retry_after_raw.isdigit():
+                                    wait = float(retry_after_raw)
+                                else:
+                                    wait = min(self._backoff_sec, config.BM_MAX_BACKOFF_SEC)
+                                    self._backoff_sec = min(self._backoff_sec * 2, config.BM_MAX_BACKOFF_SEC)
+                                self._backoff_until = time.monotonic() + wait
+                                logger.warning(
+                                    "BM 429 на %s %s (попытка %s/%s), ждём %.1fs",
+                                    method, path, attempt, max_retries, wait,
+                                )
+                                continue
 
-                        # Успешный ответ (не обязательно 429) — сбрасываем экспоненту backoff.
-                        self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
+                            # Успешный ответ (не обязательно 429) — сбрасываем экспоненту backoff.
+                            self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
 
-                        if resp.status >= 400:
-                            text = await resp.text()
-                            raise BattleMetricsError(f"{method} {path} -> {resp.status}: {text[:300]}")
+                            if resp.status >= 400:
+                                text = await resp.text()
+                                raise BattleMetricsError(f"{method} {path} -> {resp.status}: {text[:300]}")
 
-                        return await resp.json()
+                            return await resp.json()
+                    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                        logger.warning("BM запрос %s %s не ответил за %.0fs: %r", method, path, request_timeout.total, exc)
+                        raise BattleMetricsError(f"{method} {path}: no response within {request_timeout.total:.0f}s") from exc
 
             raise BattleMetricsError(f"{method} {path}: превышено число попыток после повторных 429")
         finally:
