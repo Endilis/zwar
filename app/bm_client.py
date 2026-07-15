@@ -230,35 +230,51 @@ async def search_players(nickname: str, *, page_size: int = 20) -> list[dict]:
 
 
 async def fetch_player_status(bm_player_id: str) -> dict:
-    """Снимок статуса одного игрока — 1 запрос к BM (include=server даёт нужные
-    данные без дополнительного запроса на сессии, этого достаточно для online/offline)."""
-    session = await get_session()
-    data = await _request_any_token(
-        session, "GET", f"/players/{bm_player_id}",
-        params={"include": "server"},
-    )
-    player = data.get("data") or {}
-    attrs = player.get("attributes") or {}
-    included_servers = {
-        item["id"]: item.get("attributes", {})
-        for item in data.get("included", [])
-        if item.get("type") == "server"
-    }
+    """Снимок статуса одного игрока — 1 запрос к BM.
 
-    server_rel = (player.get("relationships") or {}).get("servers", {}).get("data") or []
+    ВАЖНО (проверено вживую 2026-07-15): прямой GET /players/{id}?include=server
+    НЕ заполняет player.relationships.servers (в отличие от списочного
+    /players?filter[search]=..., который заполняет) — BM отдаёт данные о
+    серверах только в `included`, без привязки relationships на уровне
+    одного игрока. Раньше код читал именно relationships.servers и поэтому
+    ВСЕГДА получал is_online=False/server=None, вне зависимости от
+    реального статуса. Правильный путь — тот же, что уже используется в
+    сложной статистике (fetch_player_full_stats в боте): relationships/
+    sessions, page[size]=1, самая свежая сессия; stop=null означает "сессия
+    ещё не закрыта" = игрок сейчас на сервере. Имя игрока берём из самой
+    сессии (attributes.name) — отдельный запрос профиля не нужен, держим
+    1 запрос на проверку (важно для расчёта частоты опроса в panel-api)."""
+    session = await get_session()
+    sessions_data = await _request_any_token(
+        session, "GET", f"/players/{bm_player_id}/relationships/sessions",
+        params={
+            "include": "server",
+            "page[size]": 1,
+            "fields[session]": "start,stop,firstTime,name",
+            "fields[server]": "name",
+        },
+    )
+    name = None
     server_name = None
     last_seen = None
     is_online = False
-    if server_rel:
-        latest = max(server_rel, key=lambda s: (s.get("meta") or {}).get("lastSeen", ""))
-        meta = latest.get("meta") or {}
-        last_seen = meta.get("lastSeen")
-        is_online = bool(meta.get("online"))
-        server_name = included_servers.get(latest.get("id"), {}).get("name")
+    sessions = sessions_data.get("data") or []
+    if sessions:
+        latest = sessions[0]
+        s_attrs = latest.get("attributes") or {}
+        name = s_attrs.get("name")
+        last_seen = s_attrs.get("start")
+        is_online = s_attrs.get("stop") is None
+        server_id = ((latest.get("relationships") or {}).get("server") or {}).get("data", {}).get("id")
+        if server_id:
+            for item in sessions_data.get("included", []):
+                if item.get("type") == "server" and item.get("id") == server_id:
+                    server_name = (item.get("attributes") or {}).get("name")
+                    break
 
     return {
         "bm_player_id": bm_player_id,
-        "name": attrs.get("name"),
+        "name": name,
         "server": server_name,
         "last_seen": last_seen,
         "is_online": is_online,
