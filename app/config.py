@@ -34,8 +34,6 @@ BATTLEMETRICS_TOKENS = [t.strip() for t in _env("BATTLEMETRICS_TOKENS").split(",
 if not BATTLEMETRICS_TOKENS:
     raise RuntimeError("BATTLEMETRICS_TOKENS не задан в .env")
 
-REDIS_URL = _env("REDIS_URL", "redis://127.0.0.1:6379/0")
-
 # Секрет, которым панель подтверждает себя перед relay (см. паттерн
 # TICKET_BOT_INTERNAL_SECRET в основном боте).
 RELAY_SHARED_SECRET = _env("RELAY_SHARED_SECRET")
@@ -45,21 +43,18 @@ if not RELAY_SHARED_SECRET:
 # --- Rate limiting ---
 # Жёсткий пол: минимальный интервал между ЛЮБЫМИ двумя запросами к BM API,
 # независимо от заголовков лимита. Это последний рубеж защиты от бана.
-BM_MIN_REQUEST_INTERVAL_SEC = _env_float("BM_MIN_REQUEST_INTERVAL_SEC", 1.0)
+# BM с валидным токеном разрешает устойчиво 300/мин (=5/сек), см. коммент в
+# bm_client.py::_request_any_token. 0.25с = 240/мин — запас ~20% под лимитом,
+# достаточно, чтобы panel-api могла держать свежесть <5 мин даже на ~1000
+# отслеживаемых одним токеном (round-robin цикл на стороне panel-api, не
+# здесь — relay больше не хранит и не крутит список сам, см. main.py).
+BM_MIN_REQUEST_INTERVAL_SEC = _env_float("BM_MIN_REQUEST_INTERVAL_SEC", 0.25)
 # Запас прочности: если по заголовкам X-Rate-Limit-Remaining осталось меньше
 # этого числа запросов — ждём до сброса окна вместо того, чтобы бить в лимит.
 BM_RATE_LIMIT_SAFETY_MARGIN = _env_int("BM_RATE_LIMIT_SAFETY_MARGIN", 5)
 # Backoff при 429, если сервер не прислал Retry-After.
 BM_DEFAULT_BACKOFF_SEC = _env_float("BM_DEFAULT_BACKOFF_SEC", 5.0)
 BM_MAX_BACKOFF_SEC = _env_float("BM_MAX_BACKOFF_SEC", 300.0)
-
-# --- Поллер отслеживаемых игроков ---
-# Желаемое окно, за которое должен обновиться КАЖДЫЙ отслеживаемый игрок.
-# Реальный интервал на игрока = max(BM_MIN_REQUEST_INTERVAL_SEC, WATCH_REFRESH_WINDOW_SEC / N),
-# т.е. при росте списка обновления идут реже, а не быстрее лимита.
-WATCH_REFRESH_WINDOW_SEC = _env_float("WATCH_REFRESH_WINDOW_SEC", 300.0)
-# Статус считается протухшим и не отдаётся панели, если не обновлялся дольше.
-STATUS_STALE_AFTER_SEC = _env_float("STATUS_STALE_AFTER_SEC", 900.0)
 
 HOST = _env("HOST", "0.0.0.0")
 PORT = _env_int("PORT", 8000)

@@ -177,6 +177,15 @@ async def _request_any_token(session: aiohttp.ClientSession, method: str, path: 
         raise last_exc or exc
 
 
+async def raw_get(path: str, params: dict | None = None) -> dict:
+    """Публичная обёртка над _request_any_token для сложных агрегаций (см.
+    main.py::bm_proxy), где парсинг ответа остаётся на стороне вызывающего
+    сервиса — тот же безопасный лимитер/ротация токенов, что и у остальных
+    функций этого модуля."""
+    session = await get_session()
+    return await _request_any_token(session, "GET", path, params=params)
+
+
 async def search_players(nickname: str, *, page_size: int = 20) -> list[dict]:
     """Поиск кандидатов по нику — 1 запрос к BM, без фильтра на точное совпадение
     (в отличие от legacy): панель показывает варианты, пользователь выбирает сам."""
