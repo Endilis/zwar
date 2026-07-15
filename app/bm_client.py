@@ -40,9 +40,27 @@ class BattleMetricsRateLimiter:
         self._lock = asyncio.Lock()
         self._last_request_ts = 0.0
         self._rate_remaining: int | None = None
+        self._rate_limit: int | None = None
         self._rate_reset_ts: float | None = None
+        self._rate_reset_raw_header: str | None = None
         self._backoff_until = 0.0
         self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
+        self._waiters = 0
+
+    def debug_state(self) -> dict:
+        """Снимок состояния лимитера через API (логов Render под рукой нет) —
+        см. инцидент 2026-07-15, поиск/статус зависали на много минут."""
+        now = time.monotonic()
+        return {
+            "waiters_in_queue": self._waiters,
+            "lock_locked": self._lock.locked(),
+            "rate_remaining": self._rate_remaining,
+            "rate_limit": self._rate_limit,
+            "rate_reset_raw_header": self._rate_reset_raw_header,
+            "rate_reset_in_sec": (self._rate_reset_ts - now) if self._rate_reset_ts else None,
+            "backoff_in_sec": max(0.0, self._backoff_until - now),
+            "seconds_since_last_request": (now - self._last_request_ts) if self._last_request_ts else None,
+        }
 
     async def _wait_turn(self) -> None:
         # ИНЦИДЕНТ 2026-07-15: эта функция вызывается ВНУТРИ self._lock — если
@@ -83,8 +101,11 @@ class BattleMetricsRateLimiter:
         remaining = headers.get("X-Rate-Limit-Remaining")
         limit = headers.get("X-Rate-Limit-Limit")
         reset = headers.get("X-Rate-Limit-Reset")
+        self._rate_reset_raw_header = reset
         if remaining is not None and remaining.isdigit():
             self._rate_remaining = int(remaining)
+        if limit is not None and limit.isdigit():
+            self._rate_limit = int(limit)
         if reset is not None:
             try:
                 # BM отдаёт unix-timestamp секунд до сброса окна.
@@ -109,37 +130,41 @@ class BattleMetricsRateLimiter:
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        for attempt in range(1, max_retries + 1):
-            async with self._lock:
-                await self._wait_turn()
-                self._last_request_ts = time.monotonic()
-                async with session.request(method, url, headers=headers, params=params) as resp:
-                    self._record_headers(resp.headers)
+        self._waiters += 1
+        try:
+            for attempt in range(1, max_retries + 1):
+                async with self._lock:
+                    await self._wait_turn()
+                    self._last_request_ts = time.monotonic()
+                    async with session.request(method, url, headers=headers, params=params) as resp:
+                        self._record_headers(resp.headers)
 
-                    if resp.status == 429:
-                        retry_after_raw = resp.headers.get("Retry-After")
-                        if retry_after_raw and retry_after_raw.isdigit():
-                            wait = float(retry_after_raw)
-                        else:
-                            wait = min(self._backoff_sec, config.BM_MAX_BACKOFF_SEC)
-                            self._backoff_sec = min(self._backoff_sec * 2, config.BM_MAX_BACKOFF_SEC)
-                        self._backoff_until = time.monotonic() + wait
-                        logger.warning(
-                            "BM 429 на %s %s (попытка %s/%s), ждём %.1fs",
-                            method, path, attempt, max_retries, wait,
-                        )
-                        continue
+                        if resp.status == 429:
+                            retry_after_raw = resp.headers.get("Retry-After")
+                            if retry_after_raw and retry_after_raw.isdigit():
+                                wait = float(retry_after_raw)
+                            else:
+                                wait = min(self._backoff_sec, config.BM_MAX_BACKOFF_SEC)
+                                self._backoff_sec = min(self._backoff_sec * 2, config.BM_MAX_BACKOFF_SEC)
+                            self._backoff_until = time.monotonic() + wait
+                            logger.warning(
+                                "BM 429 на %s %s (попытка %s/%s), ждём %.1fs",
+                                method, path, attempt, max_retries, wait,
+                            )
+                            continue
 
-                    # Успешный ответ (не обязательно 429) — сбрасываем экспоненту backoff.
-                    self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
+                        # Успешный ответ (не обязательно 429) — сбрасываем экспоненту backoff.
+                        self._backoff_sec = config.BM_DEFAULT_BACKOFF_SEC
 
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        raise BattleMetricsError(f"{method} {path} -> {resp.status}: {text[:300]}")
+                        if resp.status >= 400:
+                            text = await resp.text()
+                            raise BattleMetricsError(f"{method} {path} -> {resp.status}: {text[:300]}")
 
-                    return await resp.json()
+                        return await resp.json()
 
-        raise BattleMetricsError(f"{method} {path}: превышено число попыток после повторных 429")
+            raise BattleMetricsError(f"{method} {path}: превышено число попыток после повторных 429")
+        finally:
+            self._waiters -= 1
 
 
 _limiter = BattleMetricsRateLimiter()

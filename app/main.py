@@ -46,6 +46,14 @@ async def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/debug/limiter", dependencies=[Depends(require_panel_secret)])
+async def debug_limiter() -> dict:
+    """Снимок состояния общего BattleMetricsRateLimiter — нет прямого доступа
+    к логам Render, это единственный способ увидеть, не завис ли лимитер
+    (см. инцидент 2026-07-15: поиск/статус зависали на много минут)."""
+    return bm_client._limiter.debug_state()
+
+
 @app.post("/players/search", response_model=SearchResponse, dependencies=[Depends(require_panel_secret)])
 async def search_players(body: SearchRequest) -> SearchResponse:
     try:
