@@ -147,7 +147,7 @@ class BattleMetricsRateLimiter:
                     # только на вызывающей стороне (клиентский timeout бота
                     # не спасает: раз лок держится в relay, ответа не будет,
                     # пока не истечёт именно ЭТОТ таймаут).
-                    request_timeout = aiohttp.ClientTimeout(total=20.0)
+                    request_timeout = aiohttp.ClientTimeout(connect=2.0, total=4.0)
                     try:
                         async with session.request(
                             method, url, headers=headers, params=params, timeout=request_timeout,

@@ -13,7 +13,7 @@ from .schemas import (
     StatusResponse,
 )
 
-_BM_PROXY_ALLOWED_PREFIXES = ("/players", "/servers")
+_BM_PROXY_ALLOWED_PREFIXES = ("/players", "/servers", "/sessions")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
